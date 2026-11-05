@@ -346,6 +346,19 @@ which aborts the operation inside the algorithm; a failed enroll ends the
 session with `EnrollFinish` (2102) and then cancels, a failed authenticate
 ends with `AuthenticateFinish` (2071) — the vendor's failure sequences.
 
+The touch worker is held off the TA until the session has armed its operation
+(`HalContext::beginOperationSetup`/`endOperationSetup`). A touch that arrives
+while the framework is still inside `authenticate()`/`enroll()` is queued and
+runs once the session is open, instead of capturing against a TA that has not
+created it yet: the TA accepts `AuthenticateStart` there but rejects the
+capture, and the finish the touch path then sends predates the operation, so
+the operation stays open and every later attempt is rejected. If the session
+cannot be opened, the HAL cancels the stale TA operation and retries once
+before reporting `ERROR_UNABLE_TO_PROCESS`; a rejected `AuthenticateFinish`
+also cancels. A successful authentication or enrollment clears the work mode,
+so a resting finger reported before the framework's cancel cannot capture
+against the session it already finished.
+
 A successful compare returns the packed `hw_auth_token_t` at `+0x88`. The
 session converts it to the AIDL token (a fingerprint token is host ordered,
 other types are byte swapped) and hands it to the framework before the HAL

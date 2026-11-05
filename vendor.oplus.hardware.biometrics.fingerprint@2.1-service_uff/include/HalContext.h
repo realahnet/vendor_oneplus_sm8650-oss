@@ -44,6 +44,16 @@ class HalContext {
     // operation that is still cleaning up.
     void waitForWorkIdle();
 
+    // Arms a session operation. Drops a touch queued for the previous
+    // operation, waits for one that is still running, then holds the touch
+    // worker until endOperationSetup(). A touch that arrives while the
+    // framework is still inside authenticate()/enroll() is kept and runs once
+    // the operation has been opened in the TA: opening the session has to
+    // finish first, because a capture issued before it is rejected and leaves
+    // the TA with an operation no later command can close.
+    void beginOperationSetup();
+    void endOperationSetup();
+
     // Hands a display touch to the operation worker. The driver reader and the
     // AIDL pointer path both come through here.
     void postTouchDown(PerfTrace::Source source);
@@ -100,6 +110,10 @@ class HalContext {
     std::mutex mWorkMutex;
     std::condition_variable mWorkCond;
     std::condition_variable mWorkDoneCond;
+    // Signalled when an operation setup finishes; the worker waits on it
+    // before it issues commands to the TA.
+    std::condition_variable mSetupCond;
+    int mSetupCount = 0;
     bool mWorkRunning = false;
     bool mTouchPending = false;
     bool mWorkActive = false;

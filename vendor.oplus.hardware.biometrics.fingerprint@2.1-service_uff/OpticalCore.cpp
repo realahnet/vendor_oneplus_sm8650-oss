@@ -67,15 +67,24 @@ int OpticalCore::abortEnroll(int ret) {
                               : FingerprintMsg::kErrorUnableToProcess);
     enrollFinish();
     cancel();
+    // The framework finishes the client on this error; leave the touch path
+    // disarmed so a stray touch cannot capture against the closed session.
+    setWorkMode(WorkMode::Idle);
     return ret;
 }
 
 int OpticalCore::abortAuth(int ret) {
     // The vendor ends a failed authenticate with the TA-side finish, which is
-    // what releases the operation there.
+    // what releases the operation there. If the TA rejects the finish, cancel
+    // as well: an operation left open keeps rejecting every later capture.
     reportError(isCancelled() ? FingerprintMsg::kErrorCanceled
                               : FingerprintMsg::kErrorUnableToProcess);
-    authenticateFinish();
+    if (authenticateFinish() != 0) {
+        cancel();
+    }
+    // The framework finishes the client on this error; leave the touch path
+    // disarmed so a stray touch cannot capture against the closed session.
+    setWorkMode(WorkMode::Idle);
     return ret;
 }
 
@@ -164,6 +173,12 @@ int OpticalCore::enrollDown() {
         }
     }
     mContext->perf().mark("enumerate");
+
+    if (remaining <= 0) {
+        // The enrollment is complete; the kernel can still report a resting
+        // finger before the framework cancels the operation.
+        setWorkMode(WorkMode::Idle);
+    }
 
     return 0;
 }
@@ -267,14 +282,16 @@ int OpticalCore::authenticateDown() {
     if (ret != 0) {
         reportError(isCancelled() ? FingerprintMsg::kErrorCanceled
                                   : FingerprintMsg::kErrorUnableToProcess);
-    }
-    mContext->perf().mark("compare");
-
-    // The token is complete after the compare. Publish it before the TA-side
-    // finish so the framework can unlock while the cleanup still runs. The
-    // worker stays busy until AuthenticateFinish returns, and the next
-    // operation waits for it, so the TA still sees one operation at a time.
-    if (mNotify != nullptr) {
+    } else if (mNotify != nullptr) {
+        // Only a completed compare carries a result. A rejected one leaves the
+        // response buffer holding whatever the TA last wrote there, so
+        // publishing it could report a match that never happened.
+        //
+        // The token is complete after the compare. Publish it before the
+        // TA-side finish so the framework can unlock while the cleanup still
+        // runs. The worker stays busy until AuthenticateFinish returns, and
+        // the next operation waits for it, so the TA still sees one operation
+        // at a time.
         if (fingerId > 0) {
             mNotify->notifyAuthResult(static_cast<uint32_t>(fingerId), mGroupId, token);
         } else {
@@ -285,6 +302,13 @@ int OpticalCore::authenticateDown() {
     mContext->perf().mark("result");
 
     authenticateFinish();
+    if (ret == 0 && fingerId > 0) {
+        // The framework ends the operation after a success. Disarm the touch
+        // path now: the kernel can still report a resting finger before the
+        // framework's cancel arrives, and that capture would be rejected by
+        // the session it already finished.
+        setWorkMode(WorkMode::Idle);
+    }
     mContext->perf().mark("finish");
 
     return ret;

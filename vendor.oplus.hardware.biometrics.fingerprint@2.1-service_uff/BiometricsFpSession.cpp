@@ -308,16 +308,21 @@ ndk::ScopedAStatus BiometricsFpSession::enroll(const HardwareAuthToken& hat,
     IFingerprintCore* core = mContext->core();
     const auto setupStart = std::chrono::steady_clock::now();
     mContext->beginUireadyOperation(false, false);
-    mContext->waitForWorkIdle();
+    mContext->beginOperationSetup();
     if (mContext->common() != nullptr) {
         mContext->common()->clearUireadyCancellation();
     }
     mContext->perf().clearSetup();
     mAcceptNotifications = true;
+    // Keep the touch path off the TA until the session has been opened there;
+    // a capture that arrives first is rejected and leaves the enrollment
+    // open in the TA.
+    core->setWorkMode(WorkMode::Idle);
     core->preEnroll();
     core->enroll(toTaAuthToken(hat), static_cast<uint32_t>(mUserId));
     core->setWorkMode(WorkMode::Enroll);
     setTouchReport(true);
+    mContext->endOperationSetup();
     mContext->perf().recordSetup("enroll", elapsedUs(setupStart));
     if (out != nullptr) {
         *out = makeCancellationSignal();
@@ -342,19 +347,50 @@ ndk::ScopedAStatus BiometricsFpSession::authenticateInternal(
     // operation's UI_READY is not dropped while the old AuthenticateFinish is
     // still unwinding.
     mContext->beginUireadyOperation(true, reuseUiready);
-    mContext->waitForWorkIdle();
+    mContext->beginOperationSetup();
     if (mContext->common() != nullptr) {
         mContext->common()->clearUireadyCancellation();
     }
     mContext->perf().clearSetup();
     mAcceptNotifications = true;
-    core->authenticate(static_cast<uint64_t>(operationId), static_cast<uint32_t>(mUserId));
+    // Do not let the touch path issue a capture while the session is being
+    // opened: the TA rejects it and the operation that it then leaves open
+    // makes every later attempt fail too.
+    core->setWorkMode(WorkMode::Idle);
+    int ret = core->authenticate(static_cast<uint64_t>(operationId),
+                                 static_cast<uint32_t>(mUserId));
+    if (ret != 0) {
+        // An operation that was aborted before its Authenticate command
+        // landed can leave the previous session open in the TA. Abort it and
+        // open a fresh one instead of letting the touch path fail on a TA
+        // that refuses new commands.
+        LOG(WARNING) << "BiometricsFpSession: cannot open the authenticate session: " << ret
+                     << ", cancelling and retrying";
+        core->cancel();
+        ret = core->authenticate(static_cast<uint64_t>(operationId),
+                                 static_cast<uint32_t>(mUserId));
+    }
+    if (ret != 0) {
+        LOG(ERROR) << "BiometricsFpSession: authenticate session open failed: " << ret;
+        mAcceptNotifications = false;
+        core->setWorkMode(WorkMode::Idle);
+        setTouchReport(false);
+        mContext->endOperationSetup();
+        if (mCallback != nullptr) {
+            mCallback->onError(Error::UNABLE_TO_PROCESS, 0);
+        }
+        if (out != nullptr) {
+            *out = makeCancellationSignal();
+        }
+        return ndk::ScopedAStatus::ok();
+    }
     core->setWorkMode(WorkMode::Authenticate);
     // AOSP has already started authentication when the finger arrives. Give
     // the TA its start command now; the touch path sends it as a fallback if
     // this did not run.
     core->prepareAuthenticate();
     setTouchReport(true);
+    mContext->endOperationSetup();
     mContext->perf().recordSetup("auth", elapsedUs(setupStart));
     if (out != nullptr) {
         *out = makeCancellationSignal();
@@ -371,7 +407,7 @@ ndk::ScopedAStatus BiometricsFpSession::detectInteraction(
     // the detect path only arms the work mode and screen-on touch reporting.
     const auto setupStart = std::chrono::steady_clock::now();
     mContext->beginUireadyOperation(false, false);
-    mContext->waitForWorkIdle();
+    mContext->beginOperationSetup();
     if (mContext->common() != nullptr) {
         mContext->common()->clearUireadyCancellation();
     }
@@ -379,6 +415,7 @@ ndk::ScopedAStatus BiometricsFpSession::detectInteraction(
     mAcceptNotifications = true;
     mContext->core()->setWorkMode(WorkMode::Detect);
     setTouchReport(true);
+    mContext->endOperationSetup();
     mContext->perf().recordSetup("detect", elapsedUs(setupStart));
     if (out != nullptr) {
         *out = makeCancellationSignal();

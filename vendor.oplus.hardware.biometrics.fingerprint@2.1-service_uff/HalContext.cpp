@@ -121,6 +121,7 @@ void HalContext::startWorkThread() {
         mWorkRunning = true;
         mTouchPending = false;
         mWorkActive = false;
+        mSetupCount = 0;
     }
     mWorkThread = std::thread(&HalContext::workThreadLoop, this);
 }
@@ -129,8 +130,12 @@ void HalContext::stopWorkThread() {
     {
         std::lock_guard<std::mutex> lock(mWorkMutex);
         mWorkRunning = false;
+        // Teardown must not wait for a setup that a stopping session will no
+        // longer complete; the worker leaves with the work mode already idle.
+        mSetupCount = 0;
     }
     mWorkCond.notify_all();
+    mSetupCond.notify_all();
     if (mWorkThread.joinable()) {
         mWorkThread.join();
     }
@@ -188,6 +193,23 @@ void HalContext::workThreadLoop() {
             if (!mWorkRunning) {
                 break;
             }
+            // The session is still arming this operation in the TA. A capture
+            // issued before the session's Authenticate/Enroll command lands
+            // is rejected by the TA and leaves it with an operation that the
+            // busy touch path already finished, so the whole sensor stops
+            // answering. Hold the touch here instead and run it once the
+            // operation is ready. The worker is not marked active until it
+            // passes this gate, so a session waiting for the previous touch
+            // cannot wait on a worker that is itself waiting for the session.
+            mSetupCond.wait(lock, [this] { return mSetupCount == 0 || !mWorkRunning; });
+            if (!mWorkRunning) {
+                break;
+            }
+            // A setup starting for the next operation drops the touch queued
+            // for the one that just ended.
+            if (!mTouchPending) {
+                continue;
+            }
             mWorkActive = true;
         }
         mPerf.mark("worker");
@@ -215,6 +237,27 @@ void HalContext::waitForWorkIdle() {
         mTouchPending = false;
     }
     mWorkDoneCond.wait(lock, [this] { return !mWorkActive; });
+}
+
+void HalContext::beginOperationSetup() {
+    std::unique_lock<std::mutex> lock(mWorkMutex);
+    // The count is taken before the idle wait so a touch cannot start between
+    // the two: the worker checks it under this same lock.
+    ++mSetupCount;
+    if (!mWorkActive) {
+        mTouchPending = false;
+    }
+    mWorkDoneCond.wait(lock, [this] { return !mWorkActive; });
+}
+
+void HalContext::endOperationSetup() {
+    {
+        std::lock_guard<std::mutex> lock(mWorkMutex);
+        if (mSetupCount > 0) {
+            --mSetupCount;
+        }
+    }
+    mSetupCond.notify_all();
 }
 
 int HalContext::init() {
